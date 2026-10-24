@@ -1,0 +1,35 @@
+name: Build Monarca (macOS universal)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compilar
+        run: cmake --build build --config Release --parallel
+
+      - name: Ver lo que se ha generado
+        run: find build -name "*.vst3" -o -name "*.component" -o -name "*.app" | head -20
+
+      - name: Empaquetar (conserva la carpeta .vst3 / .component)
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent build/Monarca_artefacts/Release/VST3/Monarca.vst3 dist/Monarca-VST3.zip
+          ditto -c -k --keepParent build/Monarca_artefacts/Release/AU/Monarca.component dist/Monarca-AU.zip
+
+      - name: Subir resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: Monarca-macOS
+          path: dist/*.zip
+          if-no-files-found: error
