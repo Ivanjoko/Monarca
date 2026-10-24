@@ -56,7 +56,6 @@ bool MonarcaProcessor::isBusesLayoutSupported (const BusesLayout& l) const
 void MonarcaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     fs = sampleRate;
-    const double twoPi = 2.0 * kPi;
 
     os.initProcessing ((size_t) samplesPerBlock);
     os.reset();
@@ -66,36 +65,39 @@ void MonarcaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     for (int c = 0; c < 2; ++c)
     {
+        lowA[c].setLowpass (fs, 150.0, 0.70710678); lowB[c].setLowpass (fs, 150.0, 0.70710678);
+        lowA[c].reset(); lowB[c].reset(); lowPrev[c] = 0.0;
+        sat[c].setParams (1.142, 0.165, 0.0); sat[c].reset();
+        dc[c].prepare (fs, 8.0);
+
         lowShelf[c].setLowShelf  (fs, 56.74,    1.38, 0.70710678);
         bell[c].setBell          (fs, 282.15,  -0.92, 0.5413);
         highShelf[c].setHighShelf(fs, 12150.0,  1.55, 0.6180);
-        scHp[c].setHighpass      (fs, 96.35, 0.70710678);
-        lowShelf[c].reset(); bell[c].reset(); highShelf[c].reset(); scHp[c].reset();
-        kIn[c].prepare (fs); kOut[c].prepare (fs);
-        lp[c] = lpPrev[c] = 0.f;
-    }
+        lowShelf[c].reset(); bell[c].reset(); highShelf[c].reset();
 
-    // Side: Butterworth 5º orden a 84.3 Hz (2 biquads + 1 polo)
-    sideHpA.setHighpass (fs, 84.3, 0.6180340);
-    sideHpB.setHighpass (fs, 84.3, 1.6180340);
-    sideHpA.reset(); sideHpB.reset(); sideLp = 0.f;
+        kIn[c].prepare (fs); kOut[c].prepare (fs);
+    }
+    mudHp.setHighpass (fs, 150.0, 0.70710678);
+    mudLp.setLowpass  (fs, 500.0, 0.70710678);
+    mudHp.reset(); mudLp.reset();
+    envTot = envMud = 0.0;
+
+    comp.prepare (fs);
+
+    sideHp.prepare (fs, 84.3);
     sideShelf.setHighShelf (fs, 6800.0, 1.15, 0.70710678);
     sideShelf.reset();
     apL.setFc (fs, 10200.0); apR.setFc (fs, 10500.0);
     apL.reset(); apR.reset();
 
-    cLow    = (float) (1.0 - std::exp (-twoPi * 150.0 / fs));
-    cSideLp = (float) (1.0 - std::exp (-twoPi * 84.3 / fs));
-    cEnv    = (float) (1.0 - std::exp (-1.0 / (0.300 * fs)));
-    cRms    = (float) (1.0 - std::exp (-1.0 / (0.020 * fs)));
-    cMs     = (float) (1.0 - std::exp (-1.0 / (0.400 * fs)));
-    cGain   = (float) (1.0 - std::exp (-twoPi * 0.5 / fs));
-    cP      = (float) (1.0 - std::exp (-1.0 / (0.020 * fs)));
-    peakRel = (float) std::exp (-1.0 / (0.100 * fs));
+    const double twoPi = 2.0 * kPi;
+    cEnv  = 1.0 - std::exp (-1.0 / (0.150 * fs));
+    cMs   = 1.0 - std::exp (-1.0 / (0.400 * fs));
+    cGain = 1.0 - std::exp (-twoPi * 0.5 / fs);
+    cP    = 1.0 - std::exp (-1.0 / (0.020 * fs));
 
     chrys = *pChrys; migr = *pMigr; scl = *pScale; wings = *pWings;
-    ms = rawMs = peak = grMain = grPar = envE = 0.f;
-    msIn = msOut = 1e-6f; gSmooth = 1.f;
+    msIn = msOut = 1e-6; gSmooth = 1.0;
 }
 
 void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -111,135 +113,128 @@ void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
 
     const float tChrys = pChrys->load(), tMigr = pMigr->load(),
                 tScale = pScale->load(), tWings = pWings->load();
-    const float trim = std::pow (10.f, pCeil->load() * 0.05f);
-    const float fsF = (float) fs;
+    const double trim = std::pow (10.0, (double) pCeil->load() * 0.05);
 
-    // ---- 0) Sonoridad de entrada (K-weighting) --------------------------------
+    // ---- 0) Sonoridad de entrada (K-weighting, BS.1770-4) ---------------------
     for (int i = 0; i < n; ++i)
     {
-        const float a = kIn[0].process (L[i]);
-        const float b = kIn[1].process (R[i]);
+        const double a = kIn[0].process (L[i]);
+        const double b = kIn[1].process (R[i]);
         msIn += cMs * ((a * a + b * b) - msIn);
     }
 
-    // ---- 1) Drive + transformador + EQ (frecuencia de muestreo nativa) -------
+    // ---- 1) Drive + transformador + EQ + de-mudder ----------------------------
     for (int i = 0; i < n; ++i)
     {
-        chrys += cP * (tChrys - chrys);
-        migr  += cP * (tMigr  - migr);
-        scl   += cP * (tScale - scl);
-        wings += cP * (tWings - wings);
+        chrys += (float) cP * (tChrys - chrys);
+        migr  += (float) cP * (tMigr  - migr);
+        scl   += (float) cP * (tScale - scl);
+        wings += (float) cP * (tWings - wings);
 
-        const float pre = 1.f + 1.5f * chrys + 1.0f * migr;
-        const float h   = 0.085f * chrys;
+        const double pre = 1.0 + 1.5 * chrys + 1.0 * migr;
+        const double h   = 0.085 * chrys;
 
+        double mono = 0.0;
         for (int c = 0; c < 2; ++c)
         {
-            float x = d[c][i] * pre;
-            lp[c] += cLow * (x - lp[c]);
-            const float p3 = lpPrev[c] * lpPrev[c] * lpPrev[c];
-            x -= h * p3;                       // y = x - h * x[n-1]^3, solo banda < 150 Hz
-            lpPrev[c] = lp[c];
+            double x = (double) d[c][i] * pre;
+
+            // Transformador: y = x - h * low[n-1]^3 (+ termino par para el 2o armonico),
+            // solo sobre la banda < 150 Hz (LR4)
+            const double low = lowB[c].process (lowA[c].process (x));
+            const double lp = lowPrev[c];
+            x += h * (0.8 * lp * lp - lp * lp * lp);
+            lowPrev[c] = low;
+
+            mono += x;
             x = lowShelf[c].process (x);
             x = bell[c].process (x);
             x = highShelf[c].process (x);
-            d[c][i] = x;
+            d[c][i] = (float) x;
         }
-        envE += cEnv * (0.5f * (L[i] * L[i] + R[i] * R[i]) - envE);
+        mono *= 0.5;
+        const double band = mudLp.process (mudHp.process (mono));
+        envTot += cEnv * (mono * mono - envTot);
+        envMud += cEnv * (band * band - envMud);
     }
 
-    // Bell dinámico: más profundo cuanto más energía hay (por bloque)
+    // Bell dinamico: se profundiza segun la fraccion de energia en 150-500 Hz
     {
-        const float lvlDb = 10.f * std::log10 (envE + 1e-12f);
-        const float depth = clampf ((lvlDb + 30.f) * 0.05f, 0.f, 1.f);
-        const float gDb   = -0.92f - 1.58f * scl * depth;
-        bell[0].setBell (fs, 282.15, (double) gDb, 0.5413);
+        const double ratio = envMud / (envTot + 1e-12);
+        const double lvlDb = 10.0 * std::log10 (envTot + 1e-12);
+        const double gate  = clampd ((lvlDb + 55.0) / 15.0, 0.0, 1.0);
+        const double depth = clampd ((ratio - 0.20) / 0.40, 0.0, 1.0) * gate;
+        const double gDb   = -0.92 - 1.58 * (double) scl * depth;
+        bell[0].setBell (fs, 282.15, gDb, 0.5413);
         bell[1].copyCoefs (bell[0]);
     }
 
-    // ---- 2) Saturación triodo @ 8x ------------------------------------------------
+    // ---- 2) Triodo clase A @ 8x con ADAA --------------------------------------
     {
+        const double lam  = 0.165 + 0.10 * (double) scl;
+        const double bias = 0.020 * (0.35 + 0.65 * (double) chrys);   // 2o armonico ~ -48 dB a nivel nominal
+        sat[0].setParams (1.142, lam, bias);
+        sat[1].setParams (1.142, lam, bias);
+
         juce::dsp::AudioBlock<float> blk (buffer);
         auto sub = blk.getSubsetChannelBlock (0, 2).getSubBlock (0, (size_t) n);
         auto up = os.processSamplesUp (sub);
-        const float gam = 1.142f, lam = 0.165f + 0.10f * scl;
         const size_t nu = up.getNumSamples();
         for (size_t c = 0; c < 2; ++c)
         {
             float* p = up.getChannelPointer (c);
             for (size_t i = 0; i < nu; ++i)
-                p[i] = triode (p[i], gam, lam);
+                p[i] = (float) sat[c].process ((double) p[i]);
         }
         os.processSamplesDown (sub);
     }
 
-    // ---- 3) Compresor + Profundidad M/S + AGC LKFS ------------------------------
-    const float driveLin = 1.5f * chrys + migr;
-    const float thr = -18.f - 20.f * std::log10 (1.f + driveLin) * 0.387f;
-    const float mixPar = 0.20f * migr;
-    float grMax = 0.f;
+    // ---- 3) DC + compresor + profundidad M/S + AGC ----------------------------
+    const double driveLin = 1.5 * chrys + migr;
+    const double thr = -18.0 - 20.0 * std::log10 (1.0 + driveLin) * 0.387;
+    const double mixPar = 0.20 * (double) migr;
+    const double agcOn = (double) (msIn > 1.17e-7);       // puerta absoluta (~ -70 LKFS)
+    float grMax = 0.f, peakOut = 0.f;
 
     for (int i = 0; i < n; ++i)
     {
-        // sidechain
-        const float sl = scHp[0].process (L[i]);
-        const float sr = scHp[1].process (R[i]);
-        ms    += cRms * (0.5f * (sl * sl + sr * sr) - ms);
-        rawMs += cRms * (0.5f * (L[i] * L[i] + R[i] * R[i]) - rawMs);
-        const float rms = std::sqrt (ms);
-        const float vdb = 20.f * std::log10 (rms + 1e-12f);
+        const double xl = dc[0].process (L[i]);
+        const double xr = dc[1].process (R[i]);
 
-        peak = std::fmax (std::fmax (std::fabs (L[i]), std::fabs (R[i])), peak * peakRel);
-        const float crest = clampf (peak / (std::sqrt (rawMs) + 1e-6f), 1.f, 8.f);
-
-        const float tauA = clampf (32.f / (1.f + 2.5f * crest), 6.5f, 28.f);
-        const float trans = clampf ((crest - 2.f) * 0.25f, 0.f, 1.f);
-        const float tauR = 420.f + (65.f - 420.f) * trans;
-        const float cA = std::exp (-1.f / (0.001f * tauA * fsF));
-        const float cR = std::exp (-1.f / (0.001f * tauR * fsF));
-
-        const float over = std::fmax (vdb - thr, 0.f);
-        const float tgtM = over * 0.5f;     // 2:1
-        const float tgtP = over * 0.75f;    // 4:1 paralelo
-
-        const float upM = (float) (tgtM > grMain);
-        const float upP = (float) (tgtP > grPar);
-        grMain += (upM * (1.f - cA) + (1.f - upM) * (1.f - cR)) * (tgtM - grMain);
-        grPar  += (upP * (1.f - cA) + (1.f - upP) * (1.f - cR)) * (tgtP - grPar);
-        grMax = std::fmax (grMax, grMain);
-
-        const float gM = std::exp (-grMain * 0.11512925f);
-        const float gP = std::exp (-grPar  * 0.11512925f);
-        const float g  = gM * (1.f - mixPar) + gP * mixPar;
-        const float cl = L[i] * g, cr = R[i] * g;
+        const auto o = comp.process (xl, xr, thr);
+        grMax = std::fmax (grMax, o.grDb);
+        const double g = (double) o.gMain * (1.0 - mixPar) + (double) o.gPar * mixPar;
+        const double cl = xl * g, cr = xr * g;
 
         // Mid/Side
-        const float M = 0.5f * (cl + cr);
-        float S = 0.5f * (cl - cr);
-        S = sideHpB.process (sideHpA.process (S));
-        sideLp += cSideLp * (S - sideLp);
-        S -= sideLp;                                   // 5º orden
-        S *= 1.f + 0.6f * wings;
-        S += wings * (sideShelf.process (S) - S);
-        const float aL = apL.process (S), aR = apR.process (S);
-        const float sL = S + wings * (aL - S);
-        const float sR = S + wings * (aR - S);
-        const float oL = M + sL, oR = M - sR;
+        const double M = 0.5 * (cl + cr);
+        double S = 0.5 * (cl - cr);
+        S = sideHp.process (S);                                   // eliptico 5o orden, 84.3 Hz
+        S *= 1.0 + 0.6 * (double) wings;
+        S += (double) wings * (sideShelf.process (S) - S);        // Baxandall alto +1.15 dB
+        const double aL = apL.process (S), aR = apR.process (S);
+        const double w = (double) wings;
+        const double sL = S + w * (aL - S), sR = S + w * (aR - S);
+        const double oL = M + sL, oR = M - sR;
 
-        // AGC (sonoridad de salida vs entrada, suavizado a 0.5 Hz)
-        const float ka = kOut[0].process (oL), kb = kOut[1].process (oR);
+        // AGC LKFS (suavizado 0.5 Hz, con puerta)
+        const double ka = kOut[0].process (oL), kb = kOut[1].process (oR);
         msOut += cMs * ((ka * ka + kb * kb) - msOut);
-        const float tg = clampf (std::sqrt ((msIn + 1e-9f) / (msOut + 1e-9f)), 0.25f, 4.f);
-        gSmooth += cGain * (tg - gSmooth);
-        gainBuf[(size_t) i] = gSmooth * trim;
+        const double tg = clampd (std::sqrt ((msIn + 1e-12) / (msOut + 1e-12)), 0.25, 4.0);
+        gSmooth += cGain * agcOn * (tg - gSmooth);
+        gainBuf[(size_t) i] = (float) (gSmooth * trim);
 
-        L[i] = oL; R[i] = oR;
+        L[i] = (float) oL; R[i] = (float) oR;
     }
 
     applyGain (L, gainBuf.data(), n);
     applyGain (R, gainBuf.data(), n);
 
+    for (int i = 0; i < n; ++i)
+        peakOut = std::fmax (peakOut, std::fmax (std::fabs (L[i]), std::fabs (R[i])));
+
     grMeter.store (grMax);
+    level.store (peakOut);
     sweet.store ((float) ((grMax > 1.5f) & (grMax < 5.5f) & (migr > 0.15f)));
 }
 

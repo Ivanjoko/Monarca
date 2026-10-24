@@ -34,50 +34,50 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
-    std::atomic<float> grMeter { 0.f };   // dB de reducción de ganancia (pico del bloque)
-    std::atomic<float> sweet { 0.f };     // 1 = "punto dulce"
+    std::atomic<float> grMeter { 0.f };   // dB de reduccion de ganancia (pico del bloque)
+    std::atomic<float> sweet   { 0.f };   // 1 = "punto dulce"
+    std::atomic<float> level   { 0.f };   // pico de salida del bloque (0..1) para animaciones
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
     double fs = 44100.0;
 
-    // Parámetros
     std::atomic<float>* pChrys = nullptr;
     std::atomic<float>* pMigr  = nullptr;
     std::atomic<float>* pScale = nullptr;
     std::atomic<float>* pWings = nullptr;
     std::atomic<float>* pCeil  = nullptr;
 
-    // Suavizado de parámetros
-    float chrys = 0.f, migr = 0.f, scl = 0.f, wings = 0.f;
+    float chrys = 0.f, migr = 0.f, scl = 0.f, wings = 0.f;   // suavizados por muestra
 
-    // Oversampling 8x (3 etapas half-band polifásicas IIR)
     juce::dsp::Oversampling<float> os { 2, 3,
         juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, true };
 
-    // Transformador (<150 Hz)
-    float lp[2] {}, lpPrev[2] {};
+    // Transformador (banda < 150 Hz, LR4) y saturador ADAA
+    monarca::SVF lowA[2], lowB[2];
+    double lowPrev[2] {};
+    monarca::TriodeADAA sat[2];
+    monarca::DCBlock dc[2];
 
-    // EQ
+    // EQ + de-mudder
     monarca::SVF lowShelf[2], bell[2], highShelf[2];
+    monarca::SVF mudHp, mudLp;
+    double envTot = 0.0, envMud = 0.0;
 
     // Compresor
-    monarca::SVF scHp[2];
-    float ms = 0.f, rawMs = 0.f, peak = 0.f, grMain = 0.f, grPar = 0.f, envE = 0.f;
+    monarca::Compressor comp;
 
     // Profundidad M/S
-    monarca::SVF sideHpA, sideHpB, sideShelf;
-    float sideLp = 0.f;
+    monarca::EllipticHP5 sideHp;
+    monarca::SVF sideShelf;
     monarca::AllPass1 apL, apR;
 
     // AGC LKFS
     monarca::KWeighting kIn[2], kOut[2];
-    float msIn = 1e-6f, msOut = 1e-6f, gSmooth = 1.f;
+    double msIn = 1e-6, msOut = 1e-6, gSmooth = 1.0;
 
-    // Coeficientes
-    float cLow = 0.f, cEnv = 0.f, cRms = 0.f, cMs = 0.f, cGain = 0.f, cP = 0.f,
-          cSideLp = 0.f, peakRel = 0.f;
+    double cEnv = 0.0, cMs = 0.0, cGain = 0.0, cP = 0.0;
 
     std::vector<float> gainBuf;
 
