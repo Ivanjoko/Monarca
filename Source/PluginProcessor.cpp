@@ -160,7 +160,7 @@ void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     // ---- 2) Saturación triodo @ 8x ------------------------------------------------
     {
         juce::dsp::AudioBlock<float> blk (buffer);
-        auto sub = blk.getSubsetChannelRange (0, 2).getSubBlock (0, (size_t) n);
+        auto sub = blk.getSubsetChannelBlock (0, 2).getSubBlock (0, (size_t) n);
         auto up = os.processSamplesUp (sub);
         const float gam = 1.142f, lam = 0.165f + 0.10f * scl;
         const size_t nu = up.getNumSamples();
