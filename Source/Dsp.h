@@ -302,4 +302,107 @@ struct Compressor
                  (float) grM };
     }
 };
+
+// ---------------------------------------------------------------------------
+// Moldeador de transitorios (diferencial de envolventes rapida - lenta).
+// Realza como maximo +3 dB el golpe inicial; independiente del nivel.
+// ---------------------------------------------------------------------------
+struct TransientShaper
+{
+    double fs = 44100.0, cFA = 0, cFR = 0, cSA = 0, cSR = 0, cG = 0;
+    double envF = 0, envS = 0, gSm = 1.0;
+
+    void prepare (double sr) noexcept
+    {
+        fs = sr;
+        auto c = [sr] (double ms) { return 1.0 - std::exp (-1.0 / (0.001 * ms * sr)); };
+        cFA = c (0.8);  cFR = c (12.0);
+        cSA = c (25.0); cSR = c (140.0);
+        cG  = c (0.25);
+        envF = envS = 0; gSm = 1.0;
+    }
+
+    inline double gain (double l, double r, double amount) noexcept
+    {
+        const double a = std::fmax (std::fabs (l), std::fabs (r));
+        const double uf = (double) (a > envF), us = (double) (a > envS);
+        envF += (uf * cFA + (1.0 - uf) * cFR) * (a - envF);
+        envS += (us * cSA + (1.0 - us) * cSR) * (a - envS);
+        const double diff = clampd (((envF - envS) / (envS + 1e-5) - 0.10) * 1.1111, 0.0, 1.0);   // zona muerta 10 %
+        const double target = 1.0 + 0.41 * amount * diff;               // 0.41 => +3 dB
+        gSm += cG * (target - gSm);
+        return gSm;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Limitador de pico verdadero con lookahead (~1.5 ms), enlazado en estereo.
+//  - Pico real estimado con interpolacion cubica (Catmull-Rom) entre muestras.
+//  - Ganancia = minimo en ventana de lookahead, suavizada por media movil
+//    (garantiza ganancia <= requerida en el pico) + release exponencial.
+//  - Sin ramas: buffers circulares de tamano potencia de 2 con mascara.
+// Latencia = lookahead - 1 muestras.
+// ---------------------------------------------------------------------------
+struct TruePeakLimiter
+{
+    static constexpr int kMax = 1024;          // potencia de 2
+    static constexpr int kMask = kMax - 1;
+
+    double dl[kMax] {}, dr[kMax] {};           // retardo del audio
+    double gReq[kMax] {};                      // ganancias requeridas
+    double mHist[kMax] {};                     // minimos (para la media movil)
+    double hl[4] {}, hr[4] {};                 // ultimas 4 muestras (deteccion)
+    int ls = 72, pos = 0;
+    double sumM = 0, gState = 1.0, cRel = 0, ceilLin = 1.0, lastGainDb = 0;
+
+    int latency() const noexcept { return ls - 1; }
+
+    void prepare (double fs, double releaseMs = 70.0) noexcept
+    {
+        ls = (int) clampd (std::round (0.0015 * fs), 8.0, 480.0);
+        cRel = 1.0 - std::exp (-1.0 / (0.001 * releaseMs * fs));
+        for (int i = 0; i < kMax; ++i) dl[i] = dr[i] = mHist[i] = 0, gReq[i] = 1.0;
+        for (int i = 0; i < 4; ++i) hl[i] = hr[i] = 0;
+        pos = 0; sumM = (double) ls; gState = 1.0; lastGainDb = 0;
+        for (int i = 0; i < kMax; ++i) mHist[i] = 1.0;
+    }
+
+    static inline double mid (const double* h) noexcept          // punto medio entre h[1] y h[2]
+    {
+        return (-h[0] + 9.0 * h[1] + 9.0 * h[2] - h[3]) * 0.0625;
+    }
+
+    // Procesa una muestra estereo; devuelve la salida con retardo (ls-1)
+    inline void process (double l, double r, double ceilingLin, double& outL, double& outR) noexcept
+    {
+        ceilLin = ceilingLin;
+
+        hl[0] = hl[1]; hl[1] = hl[2]; hl[2] = hl[3]; hl[3] = l;
+        hr[0] = hr[1]; hr[1] = hr[2]; hr[2] = hr[3]; hr[3] = r;
+        double pk = std::fmax (std::fabs (l), std::fabs (r));
+        pk = std::fmax (pk, std::fmax (std::fabs (mid (hl)), std::fabs (mid (hr))));
+        const double req = std::fmin (1.0, ceilLin / (pk + 1e-12));
+
+        dl[pos & kMask] = l; dr[pos & kMask] = r; gReq[pos & kMask] = req;
+
+        // minimo de las ultimas ls peticiones
+        double m = 1.0;
+        for (int k = 0; k < ls; ++k) m = std::fmin (m, gReq[(pos - k) & kMask]);
+
+        // media movil de ls minimos
+        sumM += m - mHist[(pos - ls) & kMask];
+        mHist[pos & kMask] = m;
+        const double avg = sumM / (double) ls;
+
+        // release exponencial; nunca por encima de la ganancia suavizada de ataque
+        gState = std::fmin (avg, gState + cRel * (1.0 - gState));
+
+        const int d = ls - 1;
+        const double yl = dl[(pos - d) & kMask] * gState;
+        const double yr = dr[(pos - d) & kMask] * gState;
+        outL = clampd (yl, -ceilLin, ceilLin);        // red de seguridad (muestra)
+        outR = clampd (yr, -ceilLin, ceilLin);
+        ++pos;
+    }
+};
 } // namespace monarca

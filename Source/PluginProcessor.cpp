@@ -29,7 +29,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MonarcaProcessor::createLayo
     l.add (std::make_unique<P> (juce::ParameterID { "migration", 1 }, "Migration", R (0.f, 1.f, 0.001f), 0.30f));
     l.add (std::make_unique<P> (juce::ParameterID { "scale", 1 },     "Scale",     R (0.f, 1.f, 0.001f), 0.35f));
     l.add (std::make_unique<P> (juce::ParameterID { "wings", 1 },     "Monarch Wings", R (0.f, 1.f, 0.001f), 0.30f));
-    l.add (std::make_unique<P> (juce::ParameterID { "ceiling", 1 },   "Ceiling",   R (-12.f, 0.f, 0.01f), 0.f,
+    l.add (std::make_unique<P> (juce::ParameterID { "ceiling", 1 },   "Ceiling",   R (-12.f, 0.f, 0.01f), -0.3f,
                                 juce::AudioParameterFloatAttributes().withLabel ("dB")));
     return l;
 }
@@ -59,7 +59,9 @@ void MonarcaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     os.initProcessing ((size_t) samplesPerBlock);
     os.reset();
-    setLatencySamples ((int) std::lround (os.getLatencyInSamples()));
+    lim.prepare (fs);
+    ts.prepare (fs);
+    setLatencySamples ((int) std::lround (os.getLatencyInSamples()) + lim.latency());
 
     gainBuf.assign ((size_t) std::max (samplesPerBlock, 16384), 1.f);
 
@@ -89,6 +91,10 @@ void MonarcaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     sideShelf.reset();
     apL.setFc (fs, 10200.0); apR.setFc (fs, 10500.0);
     apL.reset(); apR.reset();
+    apL2.setFc (fs, 4100.0); apR2.setFc (fs, 4500.0);
+    apL2.reset(); apR2.reset();
+    sLR = 0.0; sLL = sRR = 1e-9;
+    cCorr = 1.0 - std::exp (-1.0 / (0.200 * fs));
 
     const double twoPi = 2.0 * kPi;
     cEnv  = 1.0 - std::exp (-1.0 / (0.150 * fs));
@@ -113,7 +119,7 @@ void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
 
     const float tChrys = pChrys->load(), tMigr = pMigr->load(),
                 tScale = pScale->load(), tWings = pWings->load();
-    const double trim = std::pow (10.0, (double) pCeil->load() * 0.05);
+    const double ceilLin = std::pow (10.0, ((double) pCeil->load() - 0.05) * 0.05);   // margen para el pico verdadero
 
     // ---- 0) Sonoridad de entrada (K-weighting, BS.1770-4) ---------------------
     for (int i = 0; i < n; ++i)
@@ -194,27 +200,40 @@ void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     const double thr = -18.0 - 20.0 * std::log10 (1.0 + driveLin) * 0.387;
     const double mixPar = 0.20 * (double) migr;
     const double agcOn = (double) (msIn > 1.17e-7);       // puerta absoluta (~ -70 LKFS)
-    float grMax = 0.f, peakOut = 0.f;
+    float grMax = 0.f;
 
     for (int i = 0; i < n; ++i)
     {
-        const double xl = dc[0].process (L[i]);
-        const double xr = dc[1].process (R[i]);
+        double xl = dc[0].process (L[i]);
+        double xr = dc[1].process (R[i]);
+
+        // Moldeador de transitorios (pegada), antes de comprimir
+        const double tgn = ts.gain (xl, xr, (double) migr);
+        xl *= tgn; xr *= tgn;
 
         const auto o = comp.process (xl, xr, thr);
         grMax = std::fmax (grMax, o.grDb);
         const double g = (double) o.gMain * (1.0 - mixPar) + (double) o.gPar * mixPar;
         const double cl = xl * g, cr = xr * g;
 
+        // Guarda de compatibilidad mono: la anchura baja si la correlacion cae
+        sLR += cCorr * (cl * cr - sLR);
+        sLL += cCorr * (cl * cl - sLL);
+        sRR += cCorr * (cr * cr - sRR);
+        const double corr  = sLR / std::sqrt (sLL * sRR + 1e-18);
+        const double guard = clampd ((corr + 0.1) / 0.5, 0.35, 1.0);
+        const double w = (double) wings * guard;
+
         // Mid/Side
         const double M = 0.5 * (cl + cr);
         double S = 0.5 * (cl - cr);
         S = sideHp.process (S);                                   // eliptico 5o orden, 84.3 Hz
-        S *= 1.0 + 0.6 * (double) wings;
-        S += (double) wings * (sideShelf.process (S) - S);        // Baxandall alto +1.15 dB
+        S *= 1.0 + 0.6 * w;
+        S += w * (sideShelf.process (S) - S);                     // Baxandall alto +1.15 dB
         const double aL = apL.process (S), aR = apR.process (S);
-        const double w = (double) wings;
-        const double sL = S + w * (aL - S), sR = S + w * (aR - S);
+        const double bL = apL2.process (aL), bR = apR2.process (aR);   // segunda etapa de decorrelacion
+        const double sL = S + w * (aL - S) + 0.5 * w * (bL - aL);
+        const double sR = S + w * (aR - S) + 0.5 * w * (bR - aR);
         const double oL = M + sL, oR = M - sR;
 
         // AGC LKFS (suavizado 0.5 Hz, con puerta)
@@ -222,7 +241,7 @@ void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         msOut += cMs * ((ka * ka + kb * kb) - msOut);
         const double tg = clampd (std::sqrt ((msIn + 1e-12) / (msOut + 1e-12)), 0.25, 4.0);
         gSmooth += cGain * agcOn * (tg - gSmooth);
-        gainBuf[(size_t) i] = (float) (gSmooth * trim);
+        gainBuf[(size_t) i] = (float) gSmooth;
 
         L[i] = (float) oL; R[i] = (float) oR;
     }
@@ -230,11 +249,25 @@ void MonarcaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     applyGain (L, gainBuf.data(), n);
     applyGain (R, gainBuf.data(), n);
 
+    // ---- 4) Limitador de pico verdadero con lookahead ---------------------------
+    float pkL = 0.f, pkR = 0.f;
+    double gMinLim = 1.0;
     for (int i = 0; i < n; ++i)
-        peakOut = std::fmax (peakOut, std::fmax (std::fabs (L[i]), std::fabs (R[i])));
+    {
+        double yl, yr;
+        lim.process ((double) L[i], (double) R[i], ceilLin, yl, yr);
+        L[i] = (float) yl; R[i] = (float) yr;
+        pkL = std::fmax (pkL, std::fabs (L[i]));
+        pkR = std::fmax (pkR, std::fabs (R[i]));
+        gMinLim = std::fmin (gMinLim, lim.gState);
+    }
+    const float limMax = (float) (-20.0 * std::log10 (gMinLim + 1e-12));
 
     grMeter.store (grMax);
-    level.store (peakOut);
+    levelL.store (pkL);
+    levelR.store (pkR);
+    level.store (std::fmax (pkL, pkR));
+    limGr.store (limMax);
     sweet.store ((float) ((grMax > 1.5f) & (grMax < 5.5f) & (migr > 0.15f)));
 }
 

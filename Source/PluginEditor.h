@@ -104,11 +104,11 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-class MonarcaEditor : public juce::AudioProcessorEditor, private juce::Timer
+class MonarcaView : public juce::Component, private juce::Timer
 {
 public:
-    explicit MonarcaEditor (MonarcaProcessor&);
-    ~MonarcaEditor() override;
+    explicit MonarcaView (MonarcaProcessor&);
+    ~MonarcaView() override;
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -133,11 +133,25 @@ private:
     SignatureLink signature;
 
     juce::Image bgCache;
-    juce::Rectangle<float> barArea;
+    juce::Rectangle<float> barArea, barL, barR;
+    juce::Rectangle<int> meterRepaint { 526, 30, 34, 262 }, ledRepaint { 448, 288, 66, 14 };
+    float mL = 0.f, mR = 0.f, hL = 0.f, hR = 0.f, limAmt = 0.f;
     juce::Rectangle<int> titleArea { 140, 8, 280, 44 }, hintArea { 20, 314, 430, 16 };
     juce::String hint;
     float grSmooth = 0.f, shimmer = -1.f;
     bool lastSweet = false, titleWasActive = false;
 
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MonarcaView)
+};
+
+// Contenedor redimensionable: el diseño (560x340) se escala con una transformacion
+class MonarcaEditor : public juce::AudioProcessorEditor
+{
+public:
+    explicit MonarcaEditor (MonarcaProcessor&);
+    void resized() override;
+
+private:
+    MonarcaView view;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MonarcaEditor)
 };

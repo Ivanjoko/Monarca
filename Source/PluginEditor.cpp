@@ -12,8 +12,8 @@ const Row kRows[] = {
     { "MIGRATION",     "Control maestro de pegada. Sube la ganancia, baja el umbral del compresor y mezcla compresión paralela para dar cuerpo e impacto al transitorio." },
     { "SCALE",         "Claridad. Aumenta la densidad armónica de la saturación y profundiza un recorte dinámico en 282 Hz cuando se acumula \"barro\" en medios-graves." },
     { "MONARCH WINGS", "Profundidad y anchura estéreo. Abre el canal Side con desfase suave y aire en agudos. Por debajo de unos 84 Hz el estéreo se mantiene en mono." },
-    { "CEILING",       "Nivel de salida (-12 a 0 dB). Un control automático de sonoridad (ITU-R BS.1770-4) iguala el volumen percibido con el de la entrada para comparar con justicia." },
-    { "BARRA GR",      "La barra vertical de la derecha muestra cuántos dB de reducción de ganancia aplica el compresor (hasta 12 dB)." },
+    { "CEILING",       "Techo de salida (-12 a 0 dB). Un limitador de pico verdadero con anticipación de 1.5 ms protege tu conversor; el control de sonoridad iguala el volumen con la entrada." },
+    { "BARRAS",        "Las tres barras de la derecha: reducción del compresor (grande, hasta 12 dB) y nivel de salida izquierdo y derecho. El punto LIMIT se enciende cuando actúa el limitador." },
     { "PUNTO DULCE",   "Con entre 1.5 y 5.5 dB de compresión y Migration activo, el arco de Migration se enciende en naranja eléctrico." },
 };
 } // namespace
@@ -100,6 +100,28 @@ void KnobSlider::paint (juce::Graphics& g)
     g.fillPath (well);
     g.setColour (juce::Colours::white.withAlpha (0.05f + 0.04f * hoverAmt));
     g.drawEllipse (c.x - rad, c.y - rad, rad * 2.f, rad * 2.f, 0.8f);
+
+    // marcas de escala y anillo vivo (Migration)
+    {
+        const float t0 = migration ? 0.930f : 0.945f, t1 = migration ? 0.962f : 0.988f;
+        for (int k = 0; k <= 10; ++k)
+        {
+            const float f = (float) k / 10.f, a = a0 + f * (a1 - a0);
+            const float sx = std::sin (a), sy = -std::cos (a);
+            g.setColour (f <= displayPos + 0.001f ? arcCol.withAlpha (0.75f) : col::muted.withAlpha (0.45f));
+            g.drawLine (c.x + sx * rad * t0, c.y + sy * rad * t0,
+                        c.x + sx * rad * t1, c.y + sy * rad * t1, (k % 5 == 0) ? 1.2f : 0.7f);
+        }
+        if (migration)
+            for (int k = 0; k < 48; ++k)
+            {
+                const float a = juce::MathConstants<float>::twoPi * (float) k / 48.f;
+                const float pulse = 0.5f + 0.5f * std::sin (phase * 1.3f - (float) k * 0.4f);
+                g.setColour (arcCol.withAlpha (0.05f + 0.30f * lvl * pulse + 0.20f * glow * pulse));
+                g.fillEllipse (c.x + std::sin (a) * rad * 0.985f - 0.7f,
+                               c.y - std::cos (a) * rad * 0.985f - 0.7f, 1.4f, 1.4f);
+            }
+    }
 
     // 2) pista y arco de valor con resplandor
     const float arcR = rad * 0.90f;
@@ -334,13 +356,13 @@ void SignatureLink::timerCallback()
 // ===========================================================================
 // Editor
 // ===========================================================================
-MonarcaEditor::MonarcaEditor (MonarcaProcessor& p)
-    : AudioProcessorEditor (&p), proc (p),
+MonarcaView::MonarcaView (MonarcaProcessor& p)
+    : proc (p),
       chrysalis (false, "Chrysalis", "%", ui::u8 ("Chrysalis · calidez analógica: ganancia de entrada y armónicos en graves."), &p.sweet, &p.level),
       scale     (false, "Scale", "%", ui::u8 ("Scale · claridad: densidad armónica y recorte dinámico del barro (282 Hz)."), &p.sweet, &p.level),
       migration (true,  "Migration", "%", ui::u8 ("Migration · pegada: ganancia, umbral y compresión paralela acoplados."), &p.sweet, &p.level),
       wings     (false, "Monarch Wings", "%", ui::u8 ("Monarch Wings · profundidad y anchura estéreo (graves siempre en mono)."), &p.sweet, &p.level),
-      ceiling   (false, "Ceiling", "dB", ui::u8 ("Ceiling · nivel de salida con igualación automática de sonoridad."), &p.sweet, &p.level)
+      ceiling   (false, "Ceiling", "dB", ui::u8 ("Ceiling · techo de salida con limitador de pico verdadero y sonoridad igualada."), &p.sweet, &p.level)
 {
     for (auto* s : { &chrysalis, &scale, &migration, &wings, &ceiling })
     {
@@ -379,16 +401,18 @@ MonarcaEditor::MonarcaEditor (MonarcaProcessor& p)
     startTimerHz (30);
 }
 
-MonarcaEditor::~MonarcaEditor() = default;
+MonarcaView::~MonarcaView() = default;
 
-void MonarcaEditor::resized()
+void MonarcaView::resized()
 {
     chrysalis.setBounds (39, 50, 96, 96);
     scale.setBounds     (39, 180, 96, 96);
     migration.setBounds (190, 78, 180, 180);
     wings.setBounds     (425, 50, 96, 96);
     ceiling.setBounds   (425, 180, 96, 96);
-    barArea = { 546.f, 50.f, 1.5f, 226.f };
+    barArea = { 543.5f, 50.f, 1.5f, 226.f };
+    barL = { 548.5f, 50.f, 1.5f, 226.f };
+    barR = { 551.5f, 50.f, 1.5f, 226.f };
 
     info.setBounds (getWidth() - 36, 12, 20, 20);
     overlay.setBounds (getLocalBounds());
@@ -396,16 +420,16 @@ void MonarcaEditor::resized()
     rebuildBackground();
 }
 
-void MonarcaEditor::rebuildBackground()
+void MonarcaView::rebuildBackground()
 {
-    const float s = 2.f;      // cache vectorial a 2x para pantallas Retina
+    const float s = 3.f;      // cache vectorial a 3x (Retina y ventana ampliada)
     bgCache = juce::Image (juce::Image::ARGB, (int) (getWidth() * s), (int) (getHeight() * s), true);
     juce::Graphics g (bgCache);
     g.addTransform (juce::AffineTransform::scale (s));
     paintStatic (g);
 }
 
-void MonarcaEditor::paintWingGrid (juce::Graphics& g) const
+void MonarcaView::paintWingGrid (juce::Graphics& g) const
 {
     const float cx = 280.f, cy = 170.f;
     juce::Path veins, cells;
@@ -434,7 +458,7 @@ void MonarcaEditor::paintWingGrid (juce::Graphics& g) const
     g.strokePath (cells, juce::PathStrokeType (0.5f));
 }
 
-void MonarcaEditor::paintStatic (juce::Graphics& g) const
+void MonarcaView::paintStatic (juce::Graphics& g) const
 {
     // fondo con viñeta radial
     g.setGradientFill (juce::ColourGradient (Colour (0xff131316), 280.f, 150.f,
@@ -490,36 +514,39 @@ void MonarcaEditor::paintStatic (juce::Graphics& g) const
     g.fillPath (dia);
 
     // escala de la barra de gain reduction
-    g.setColour (col::muted.withAlpha (0.35f));
-    g.fillRect (barArea);
+    g.setColour (col::muted.withAlpha (0.30f));
+    g.fillRect (barArea); g.fillRect (barL); g.fillRect (barR);
     g.setColour (col::muted.withAlpha (0.6f));
-    g.setFont (ui::sans (7.f, "Regular"));
-    g.drawText ("GR", 538, 36, 20, 10, juce::Justification::centred, false);
+    g.setFont (ui::sans (6.5f, "Regular"));
+    g.drawText ("GR", 534, 36, 20, 10, juce::Justification::centred, false);
+    g.drawText ("L R", 544, 36, 14, 10, juce::Justification::centred, false);
+    g.setFont (ui::sans (6.5f, "Regular").withExtraKerningFactor (0.2f));
+    g.drawText ("LIMIT", 464, 291, 40, 8, juce::Justification::centredLeft, false);
     for (int k = 0; k <= 4; ++k)
         g.fillRect (barArea.getX() - 4.f, barArea.getY() + barArea.getHeight() * (float) k / 4.f - 0.25f, 3.f, 0.5f);
 }
 
-void MonarcaEditor::setHint (const juce::String& h)
+void MonarcaView::setHint (const juce::String& h)
 {
     if (h == hint) return;
     hint = h;
     repaint (hintArea);
 }
 
-void MonarcaEditor::mouseEnter (const juce::MouseEvent& e)
+void MonarcaView::mouseEnter (const juce::MouseEvent& e)
 {
     if (auto* k = dynamic_cast<KnobSlider*> (e.eventComponent)) setHint (k->hintText);
 }
 
-void MonarcaEditor::mouseExit (const juce::MouseEvent& e)
+void MonarcaView::mouseExit (const juce::MouseEvent& e)
 {
     if (dynamic_cast<KnobSlider*> (e.eventComponent) != nullptr) setHint ({});
 }
 
-void MonarcaEditor::paint (juce::Graphics& g)
+void MonarcaView::paint (juce::Graphics& g)
 {
     g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
-    g.drawImageTransformed (bgCache, juce::AffineTransform::scale (0.5f));
+    g.drawImageTransformed (bgCache, juce::AffineTransform::scale (1.f / 3.f));
 
     // titulo con reflejo ambar que lo recorre cada pocos segundos
     {
@@ -546,6 +573,27 @@ void MonarcaEditor::paint (juce::Graphics& g)
     g.setColour (bc);
     g.fillRect (barArea.withHeight (fill));
 
+    // medidores de salida L/R con retencion de pico
+    auto meter = [&g] (Rectangle<float> r, float v, float hold)
+    {
+        const float h = juce::jlimit (0.f, 1.f, v) * r.getHeight();
+        g.setGradientFill (juce::ColourGradient (col::target, 0.f, r.getY(), col::amber.darker (0.3f), 0.f, r.getBottom(), false));
+        g.fillRect (Rectangle<float> (r.getX(), r.getBottom() - h, r.getWidth(), h));
+        g.setColour (col::text.withAlpha (0.85f));
+        g.fillRect (r.getX(), r.getBottom() - juce::jlimit (0.f, 1.f, hold) * r.getHeight() - 0.5f, r.getWidth(), 1.0f);
+    };
+    meter (barL, mL, hL);
+    meter (barR, mR, hR);
+
+    // LED del limitador
+    g.setColour (col::muted.interpolatedWith (col::target, limAmt));
+    g.fillEllipse (456.f, 293.f, 4.f, 4.f);
+    if (limAmt > 0.05f)
+    {
+        g.setColour (col::target.withAlpha (0.25f * limAmt));
+        g.fillEllipse (454.f, 291.f, 8.f, 8.f);
+    }
+
     // linea de ayuda
     g.setFont (ui::sans (9.f, "Light"));
     g.setColour (hint.isEmpty() ? col::muted.withAlpha (0.65f) : col::text.withAlpha (0.85f));
@@ -553,12 +601,18 @@ void MonarcaEditor::paint (juce::Graphics& g)
                 hintArea, juce::Justification::centredLeft, false);
 }
 
-void MonarcaEditor::timerCallback()
+void MonarcaView::timerCallback()
 {
     grSmooth += 0.3f * (proc.grMeter.load() - grSmooth);
     const bool sw = proc.sweet.load() > 0.5f;
     lastSweet = sw;
-    repaint (barArea.expanded (6.f, 2.f).toNearestInt());
+    auto dbPos = [] (float lin) { return juce::jlimit (0.f, 1.f, (20.f * std::log10 (lin + 1e-6f) + 60.f) / 60.f); };
+    const float tl = dbPos (proc.levelL.load()), tr = dbPos (proc.levelR.load());
+    mL = juce::jmax (tl, mL - 0.05f);  mR = juce::jmax (tr, mR - 0.05f);
+    hL = juce::jmax (mL, hL - 0.006f); hR = juce::jmax (mR, hR - 0.006f);
+    limAmt += 0.3f * (juce::jlimit (0.f, 1.f, proc.limGr.load() / 1.5f) - limAmt);
+    repaint (meterRepaint);
+    repaint (ledRepaint);
 
     // reflejo del titulo: 2.5 s de recorrido cada 10 s
     const double t = std::fmod (juce::Time::getMillisecondCounterHiRes() * 0.001, 10.0);
@@ -567,4 +621,23 @@ void MonarcaEditor::timerCallback()
     if (active || titleWasActive)
         repaint (titleArea);
     titleWasActive = active;
+}
+
+// ===========================================================================
+// Contenedor redimensionable
+// ===========================================================================
+MonarcaEditor::MonarcaEditor (MonarcaProcessor& p)
+    : AudioProcessorEditor (&p), view (p)
+{
+    addAndMakeVisible (view);
+    setResizable (true, true);
+    setResizeLimits (420, 255, 1120, 680);
+    getConstrainer()->setFixedAspectRatio (560.0 / 340.0);
+    setSize (560, 340);
+}
+
+void MonarcaEditor::resized()
+{
+    view.setBounds (0, 0, 560, 340);
+    view.setTransform (juce::AffineTransform::scale ((float) getWidth() / 560.f));
 }

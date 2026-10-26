@@ -37,6 +37,9 @@ public:
     std::atomic<float> grMeter { 0.f };   // dB de reduccion de ganancia (pico del bloque)
     std::atomic<float> sweet   { 0.f };   // 1 = "punto dulce"
     std::atomic<float> level   { 0.f };   // pico de salida del bloque (0..1) para animaciones
+    std::atomic<float> levelL  { 0.f };   // pico de salida L (lineal)
+    std::atomic<float> levelR  { 0.f };   // pico de salida R (lineal)
+    std::atomic<float> limGr   { 0.f };   // dB de reduccion del limitador (pico del bloque)
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
@@ -74,6 +77,11 @@ private:
     monarca::AllPass1 apL, apR;
 
     // AGC LKFS
+    monarca::TransientShaper ts;
+    monarca::TruePeakLimiter lim;
+    monarca::AllPass1 apL2, apR2;
+    double sLR = 0.0, sLL = 1e-9, sRR = 1e-9, cCorr = 0.0;
+
     monarca::KWeighting kIn[2], kOut[2];
     double msIn = 1e-6, msOut = 1e-6, gSmooth = 1.0;
 
